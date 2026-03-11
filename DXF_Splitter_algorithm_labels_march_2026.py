@@ -1,0 +1,509 @@
+import os
+from qgis.PyQt.QtCore import QCoreApplication
+from qgis.core import (QgsProcessing,
+                       QgsProcessingAlgorithm,
+                       QgsProcessingParameterFolderDestination,
+                       QgsProcessingParameterFile,
+                       QgsVectorLayer,
+                       QgsVectorFileWriter,
+                       QgsProject,
+                       QgsWkbTypes,
+                       QgsProcessingContext,
+                       QgsProcessingParameterBoolean,
+                       QgsProcessingOutputLayerDefinition,
+                       QgsProcessingParameterEnum,
+                       QgsProcessingParameterString,
+                       QgsProcessingException,
+                       QgsProcessingParameterCrs,
+                       QgsProcessingParameterCoordinateOperation,
+                       QgsFeature,
+                       QgsCoordinateTransform,
+                       QgsGeometry,
+                       QgsProperty,
+                       QgsPalLayerSettings,
+                       QgsTextFormat,
+                       QgsVectorLayerSimpleLabeling)
+
+import re
+from PyQt5.QtCore import QSizeF, QPointF
+import ezdxf
+from qgis.core import *
+import os
+
+
+
+
+
+class DXF_SplitterAlgorithm(QgsProcessingAlgorithm):
+
+    INPUT = 'INPUT'
+    OUTPUT_FOLDER = 'OUTPUT_FOLDER'
+    LOAD_TO_PROJECT = 'LOAD_TO_PROJECT'
+    EXPORT_FORMAT = 'EXPORT_FORMAT'
+    GPKG_NAME = 'GPKG_NAME'
+    TARGET_CRS = 'TARGET_CRS'
+
+    # ----------------------------------------------------------------------
+    # FIND TEXT FIELD
+    # ----------------------------------------------------------------------
+    def _find_text_field(self, fields) -> str:
+        """
+        Try to locate a field that holds the CAD text content.
+        """
+        candidates = {"text", "mtext", "label", "string", "content", "annot", "note"}
+        by_lower = {f.name().lower(): f.name() for f in fields}
+
+        for key in candidates:
+            if key in by_lower:
+                return by_lower[key]
+
+        # fallback: first string field
+        for f in fields:
+            if f.typeName().lower() in ("string", "text", "varchar", "char"):
+                return f.name()
+
+        return ""
+
+    # ----------------------------------------------------------------------
+    # IS TEXT LAYER?
+    # ----------------------------------------------------------------------
+    def _is_text_layer(self, lyr: QgsVectorLayer) -> bool:
+        if lyr.geometryType() not in (QgsWkbTypes.PointGeometry,):
+            return False
+        txt = self._find_text_field(lyr.fields())
+        return bool(txt)
+
+    # ----------------------------------------------------------------------
+    # BUILD COLOR EXPRESSION
+    # ----------------------------------------------------------------------
+    def _build_color_expression(self, fields) -> str:
+        names = {f.name().lower(): f.name() for f in fields}
+
+        # Case 1: RGB string
+        if "rgb" in names:
+            rgb = names["rgb"]
+            return (
+                f"color_rgb("
+                f"to_int(split(\"{rgb}\",',')[0]),"
+                f"to_int(split(\"{rgb}\",',')[1]),"
+                f"to_int(split(\"{rgb}\",',')[2]) )"
+            )
+
+        # Case 2: separate channels
+        if {"red", "green", "blue"}.issubset(names.keys()):
+            r, g, b = names["red"], names["green"], names["blue"]
+            return f"color_rgb(\"{r}\", \"{g}\", \"{b}\")"
+
+        # Case 3: AutoCAD color index
+        if "color" in names:
+            c = names["color"]
+            return (
+                f"CASE "
+                f"WHEN \"{c}\"=1 THEN color_rgb(255,0,0) "
+                f"WHEN \"{c}\"=2 THEN color_rgb(255,255,0) "
+                f"WHEN \"{c}\"=3 THEN color_rgb(0,255,0) "
+                f"WHEN \"{c}\"=4 THEN color_rgb(0,255,255) "
+                f"WHEN \"{c}\"=5 THEN color_rgb(0,0,255) "
+                f"WHEN \"{c}\"=6 THEN color_rgb(255,0,255) "
+                f"WHEN \"{c}\"=7 THEN color_rgb(0,0,0) "
+                f"ELSE color_rgb(0,0,0) END"
+            )
+
+        return "color_rgb(0,0,0)"
+
+    # ----------------------------------------------------------------------
+    # APPLY LABELING
+    # ----------------------------------------------------------------------
+    def _apply_cad_text_labeling(self, lyr: QgsVectorLayer, feedback,
+                                 height_scale: float = 1.0,
+                                 default_font: str = "Arial"):
+
+        if not lyr.isValid():
+            return
+
+        renderer = lyr.renderer()
+        if renderer and renderer.type() == "CadAnnotation":
+            lyr.setRenderer(QgsNullSymbolRenderer(QgsMarkerSymbol()))
+            
+        fields = lyr.fields()
+        text_field = self._find_text_field(fields)
+        if not text_field:
+            feedback.pushInfo(f"[Labeling] No text field found for {lyr.name()}, skipping.")
+            return
+
+        by_lower = {f.name().lower(): f.name() for f in fields}
+        height_field = by_lower.get("height") or by_lower.get("txtheight")
+        angle_field = by_lower.get("angle") or by_lower.get("rotation")
+        font_field = by_lower.get("font") or by_lower.get("textstyle")
+
+        color_expr = self._build_color_expression(fields)
+
+        
+       
+        pal = QgsPalLayerSettings()
+        pal.fieldName = f"\"{text_field}\""
+        pal.isExpression = True
+        pal.placement = QgsPalLayerSettings.Placement.OverPoint
+        pal.upsidedownLabels = QgsPalLayerSettings.ShowAll
+        pal.displayAll = True
+        pal.obstacle = False
+        pal.drawLabels = True
+ 
+
+        txt = QgsTextFormat()
+        from qgis.PyQt.QtGui import QFont
+        from qgis.core import QgsUnitTypes
+         
+        # Default font (overridden per-feature when font_field exists) 
+        txt.setFont(QFont(default_font))
+        
+        # Critical: CAD height is in drawing units, so use map units
+        txt.setSizeUnit(QgsUnitTypes.RenderMapUnits)
+
+        ddp_format = txt.dataDefinedProperties()
+        
+        # Exact CAD height (no scaling)
+        if height_field:
+            ddp_format.setProperty(
+                QgsPalLayerSettings.Size,
+                QgsProperty.fromExpression(
+                    f"coalesce(\"{height_field}\" * {height_scale}, 2)")
+            )
+        else: 
+            # visible fallback in map units; does not change points
+            txt.setSize(0.5)
+            
+        
+        # CAD Coloe (RGB / R,G,B / ACI) 
+        ddp_format.setProperty(
+            QgsPalLayerSettings.Color,
+            QgsProperty.fromExpression(color_expr)
+        )
+
+        
+        # CAD font family if present
+        if font_field:
+            ddp_format.setProperty(
+            QgsPalLayerSettings.Family,
+            QgsProperty.fromField(font_field))
+            
+        
+        txt.setDataDefinedProperties(ddp_format)
+
+        # CAD Rotation
+        ddp_layer = pal.dataDefinedProperties()
+        if angle_field:
+            ddp_layer.setProperty(
+                QgsPalLayerSettings.Rotation,
+                QgsProperty.fromField(angle_field)
+            )
+        
+        
+        
+        pal.setDataDefinedProperties(ddp_layer)
+        pal.setFormat(txt)
+
+        lyr.setLabelsEnabled(True)
+        lyr.setLabeling(QgsVectorLayerSimpleLabeling(pal))
+        lyr.triggerRepaint()
+
+        feedback.pushInfo(f"[Labeling] Applied CAD text labeling to: {lyr.name()}")
+
+    # ----------------------------------------------------------------------
+    # WRITE QML
+    # ----------------------------------------------------------------------
+    def write_cad_text_qml(self, qml_path: str):
+        qml = """
+<qgis version="3.34">
+  <renderer-v2 type="singleSymbol">
+     <symbols>
+       <symbol name="0" type="marker">
+         <layer class="TextMarker">
+           <prop k="textField" v="text"/>
+           <prop k="sizeExpression" v="coalesce(height,2)"/>
+           <prop k="colorExpression" v="color"/>
+           <prop k="angleExpression" v="angle"/>
+           <prop k="font" v="Arial"/>
+         </layer>
+       </symbol>
+    </symbols>
+  </renderer-v2>
+</qgis>
+"""
+        #with open(qml_path, "w", encoding="utf-8") as f:
+         #   f.write(qml)
+
+    # ----------------------------------------------------------------------
+    # SAFE TABLE NAME
+    # ----------------------------------------------------------------------
+    def make_safe_tablename(self, name: str) -> str:
+        if not re.match(r'^[A-Za-z0-9]', name):
+            name = "L_" + name
+        safe = re.sub(r'[^A-Za-z0-9_]+', '_', name)
+        safe = re.sub(r'_+', '_', safe)
+        return safe.strip('_') or "Layer"
+
+    # ----------------------------------------------------------------------
+    # SHORT GEOMETRY CODE
+    # ----------------------------------------------------------------------
+    def short_geom_code(self, geom_str: str) -> str:
+        g = geom_str.upper()
+        if "POINT" in g: return "PT"
+        if "LINE" in g: return "LN"
+        if "POLYGON" in g: return "PG"
+        return "UK"
+
+    # ----------------------------------------------------------------------
+    # PARAMETERS
+    # ----------------------------------------------------------------------
+    def initAlgorithm(self, config=None):
+
+        self.addParameter(QgsProcessingParameterFile(
+            self.INPUT, 'Input DXF file', extension='dxf'
+        ))
+
+        self.addParameter(QgsProcessingParameterFolderDestination(
+            self.OUTPUT_FOLDER, 'Output folder'
+        ))
+
+        self.addParameter(QgsProcessingParameterBoolean(
+            self.LOAD_TO_PROJECT,
+            'Load exported layers to project',
+            defaultValue=False
+        ))
+
+        self.addParameter(QgsProcessingParameterEnum(
+            self.EXPORT_FORMAT, 'Export Format',
+            options=[
+                'Separate SHP files',
+                'Separate GPKG files',
+                'Single GPKG',
+                'Grouped by Geometry (GPKG)',
+                'Grouped by Geometry (SHP)'
+            ],
+            defaultValue=0
+        ))
+
+        self.addParameter(QgsProcessingParameterString(
+            self.GPKG_NAME, 'GeoPackage Name',
+            defaultValue='output.gpkg', optional=True
+        ))
+
+        self.addParameter(QgsProcessingParameterCrs(
+            self.TARGET_CRS, 'Target CRS'
+        ))
+
+    # ----------------------------------------------------------------------
+    # MAIN PROCESSING LOGIC
+    # ----------------------------------------------------------------------
+    def processAlgorithm(self, parameters, context, feedback):
+
+        import os, re
+
+        input_path = parameters[self.INPUT]
+        output_folder = parameters[self.OUTPUT_FOLDER]
+        load_to_project = parameters[self.LOAD_TO_PROJECT]
+        export_format = parameters[self.EXPORT_FORMAT]
+        gpkg_name = parameters[self.GPKG_NAME]
+        gpkg_path = os.path.join(output_folder, gpkg_name)
+
+        dxf_name = os.path.splitext(os.path.basename(input_path))[0]
+
+        layer = QgsVectorLayer(input_path, "DXF Layer","ogr")
+        if not layer.isValid():
+            raise QgsProcessingException("Failed to load DXF file.")
+
+        target_crs = self.parameterAsCrs(parameters, self.TARGET_CRS, context)
+        src_crs = layer.sourceCrs()
+        transform_context = QgsProject.instance().transformContext()
+
+        groups = {}
+
+        layer_field = next(
+            (f.name() for f in layer.fields() if f.name().lower() == "layer"), None
+        )
+
+        for feat in layer.getFeatures():
+            geom_str = QgsWkbTypes.displayString(feat.geometry().wkbType())
+            lname = feat[layer_field] if layer_field else "UnknownLayer"
+
+            if export_format in (3, 4):
+                key = geom_str
+            else:
+                key = (lname, geom_str)
+
+            groups.setdefault(key, []).append(feat)
+
+        def load_gpkg_layer(path, table_name, display_name):
+            uri = f"{path}|layername={table_name}"
+            return QgsVectorLayer(uri, display_name, "ogr")
+
+        for key, features in groups.items():
+
+            if export_format in (3, 4):
+                lname = key
+                geom_str = key
+            else:
+                lname, geom_str = key
+
+            full_layer_name = lname
+
+            geom_code = self.short_geom_code(geom_str)
+            safe_table = self.make_safe_tablename(f"{lname}_{geom_code}")
+
+            opts = QgsVectorFileWriter.SaveVectorOptions()
+
+            if export_format == 0:
+                output_path = os.path.join(output_folder, f"{lname}.shp")
+                opts.driverName = "ESRI Shapefile"
+
+            elif export_format == 1:
+                output_path = os.path.join(output_folder, f"{lname}.gpkg")
+                opts.driverName = "GPKG"
+                opts.layerName = safe_table
+                opts.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteFile
+
+            elif export_format == 2:
+                output_path = gpkg_path
+                opts.driverName = "GPKG"
+                opts.layerName = safe_table
+                if not os.path.exists(output_path):
+                    opts.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteFile
+                else:
+                    opts.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteLayer
+
+            elif export_format == 3:
+                output_path = os.path.join(output_folder, f"{dxf_name}_{geom_code}.gpkg")
+                opts.driverName = "GPKG"
+                opts.layerName = safe_table
+                opts.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteFile
+
+            elif export_format == 4:
+                output_path = os.path.join(output_folder, f"{dxf_name}_{geom_code}.shp")
+                opts.driverName = "ESRI Shapefile"
+
+            fields = features[0].fields()
+            geometry_type = features[0].geometry().wkbType()
+            transform = QgsCoordinateTransform(src_crs, target_crs, transform_context)
+
+            writer = QgsVectorFileWriter.create(
+                output_path, fields, geometry_type, target_crs,
+                transform_context, opts
+            )
+
+            if writer.hasError() != QgsVectorFileWriter.NoError:
+                feedback.reportError(
+                    f"Writer error ({full_layer_name}): {writer.errorMessage()}"
+                )
+                del writer
+                continue
+
+            for f in features:
+                nf = QgsFeature(fields)
+                geom = QgsGeometry(f.geometry())
+                geom.transform(transform)
+                nf.setGeometry(geom)
+                for idx, fld in enumerate(fields):
+                    val = f[fld.name()]
+  
+                    # ---- INLINE MTEXT SUBTEXT CLEANUP (NO EXTRA FUNCTION ADDED) ---
+                    if isinstance(val, str) and fld.name().lower() in ("text", "mtext", "string", "label", "content"):
+                    
+
+                         # stacked fractions \S1/2;
+                         val = re.sub(
+                             r"\\S([^;]+);",
+                             lambda m: (
+                                "½" if m.group(1) in ("1/2", "1#2") else
+                                "¼" if m.group(1) in ("1/4", "1#4") else
+                                "¾" if m.group(1) in ("3/4", "3#4") else
+                                m.group(1).replace("#","/")
+                             ),
+                             val  
+                            )
+                        
+                         # remove \H0.8x; height codes
+                         val = re.sub(r"\\H[0-9.]+x;", "", val)
+
+                         # remove \A1; alignment codes
+                         val = re.sub(r"\\A\d+;", "", val)
+
+                         # replace paragraph breaks
+                         val = val.replace("\\P", "\n")
+                    
+                    nf[idx] = val
+
+  
+                  
+                writer.addFeature(nf)
+
+            del writer
+
+            if load_to_project:
+                if opts.driverName == "GPKG":
+                    lyr = load_gpkg_layer(output_path, safe_table, full_layer_name)
+                else:
+                    lyr = QgsVectorLayer(output_path, full_layer_name, "ogr")
+
+                if lyr.isValid():
+                    try:
+                        if self._is_text_layer(lyr):
+                            self._apply_cad_text_labeling(
+                                lyr, feedback, height_scale=1.0, default_font="Arial"
+                            )
+                            #qml_out = os.path.join(
+                            #    os.path.dirname(output_path),
+                            #    f"{safe_table}.qml"
+                            #)
+                            #lyr.saveNamedStyle(qml_out)
+                            #feedback.pushInfo(f"[Labeling] Saved style: {qml_out}")
+
+                    except Exception as e:
+                        feedback.reportError(f"[Labeling] Failed on {full_layer_name}: {e}")
+
+                    QgsProject.instance().addMapLayer(lyr)
+                    
+                    try:
+                        if self._is_text_layer(lyr):
+                            try:
+                               from qgis.core import QgsNullSymbolRenderer
+                               lyr.setRenderer(QgsNullSymbolRenderer())
+                            except Exception:
+                               pass 
+                               
+                            
+                            self._apply_cad_text_labeling(
+                                lyr,feedback, height_scale=1.0, default_font="Arial"
+                            )
+                            
+                            lyr.triggerRepaint()
+                            feedback.pushInfo(f"[Labeling] Applied AFTER Load {full_layer_name}")
+                            
+                    except Exception as e:
+                        feedback.reportError(f"[Labeling ERROR after load {e}")
+
+                else:
+                    feedback.reportError(f"Failed to load: {full_layer_name}")
+
+        return {self.OUTPUT_FOLDER: output_folder}
+
+    # ----------------------------------------------------------------------
+    # METADATA
+    # ----------------------------------------------------------------------
+    def name(self):
+        return "DXF_Splitter"
+
+    def displayName(self):
+        return self.tr("DXF Splitter")
+
+    def group(self):
+        return self.tr(self.groupId())
+
+    def groupId(self):
+        return "CAD_Tools"
+
+    def tr(self, s):
+        return QCoreApplication.translate("Processing", s)
+
+    def createInstance(self):
+        return DXF_SplitterAlgorithm()
